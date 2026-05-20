@@ -77,27 +77,64 @@ func SetupHeartBeat(name, namespace string, updater func(string, string)) {
 	}()
 }
 
-// SetupPortForwardHeartBeat setup heartbeat watcher for port forward
-func SetupPortForwardHeartBeat(port int) *time.Ticker {
+// SetupPortForwardHeartBeat setup heartbeat watcher for port forward.
+// For SSH port (remotePort=22), reads banner to verify SPDY tunnel is alive.
+// For other ports, falls back to TCP connect only.
+func SetupPortForwardHeartBeat(port int, remotePort int, stop chan struct{}) *time.Ticker {
 	ticker := time.NewTicker(util.PortForwardHeartBeatIntervalSec*time.Second - util.RandomSeconds(0, 5))
+	isSSH := remotePort == 22
 	go func() {
-	TickLoop:
-		for {
-			select {
-			case <-ticker.C:
-				if conn, err := net.Dial("tcp", fmt.Sprintf(":%d", port)); err != nil {
-					log.Warn().Err(err).Msgf("Heartbeat port forward %d ticked failed", port)
-				} else {
-					log.Debug().Msgf("Heartbeat port forward %d ticked at %s", port, util.FormattedTime())
+		consecutiveFailures := 0
+		for range ticker.C {
+			ok := false
+			if isSSH {
+				ok = sshDataProbe(port)
+			} else {
+				if conn, err := net.DialTimeout("tcp", fmt.Sprintf(":%d", port), 5*time.Second); err == nil {
 					_ = conn.Close()
+					ok = true
 				}
-			case <-time.After(2 * util.PortForwardHeartBeatIntervalSec * time.Second):
-				log.Debug().Msgf("Port forward heartbeat %d stopped", port)
-				break TickLoop
+			}
+			if ok {
+				consecutiveFailures = 0
+				log.Debug().Msgf("Heartbeat port forward %d ticked at %s", port, util.FormattedTime())
+			} else {
+				consecutiveFailures++
+				log.Warn().Msgf("Heartbeat port forward %d probe failed (%d/3)", port, consecutiveFailures)
+				if isSSH && consecutiveFailures >= 3 {
+					log.Warn().Msgf("Port forward %d SPDY dead, forcing reconnect", port)
+					close(stop)
+					ticker.Stop()
+					return
+				}
 			}
 		}
 	}()
 	return ticker
+}
+
+// sshDataProbe connects to the local port-forward port and reads the SSH banner.
+// If data arrives, the SPDY tunnel is alive. If timeout, SPDY is dead.
+func sshDataProbe(port int) bool {
+	result := make(chan bool, 1)
+	go func() {
+		conn, err := net.DialTimeout("tcp", fmt.Sprintf(":%d", port), 5*time.Second)
+		if err != nil {
+			result <- false
+			return
+		}
+		defer conn.Close()
+		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		buf := make([]byte, 32)
+		n, _ := conn.Read(buf)
+		result <- n > 0
+	}()
+	select {
+	case r := <-result:
+		return r
+	case <-time.After(12 * time.Second):
+		return false
+	}
 }
 
 func resourceHeartbeatPatch() string {

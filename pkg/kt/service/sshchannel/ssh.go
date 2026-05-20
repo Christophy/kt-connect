@@ -24,15 +24,56 @@ func (s SocksLogger) Println(v ...any) {
 
 // StartSocks5Proxy start socks5 proxy
 func (c *Cli) StartSocks5Proxy(privateKey, sshAddress, socks5Address string) (err error) {
-	dialer, err := sshproxy.NewDialer(getSshTunnelAddress(privateKey, sshAddress))
+	sshAddr := getSshTunnelAddress(privateKey, sshAddress)
+	dialer, err := sshproxy.NewDialer(sshAddr)
 	if err != nil {
 		return err
 	}
-	defer dialer.Close()
+
+	c.mu.Lock()
+	c.currentDialer = dialer
+	c.sshAddr = sshAddr
+	c.mu.Unlock()
 
 	svc := &socks5.Server{
-		Logger:    SocksLogger{},
-		ProxyDial: dialer.DialContext,
+		Logger: SocksLogger{},
+		ProxyDial: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			c.mu.Lock()
+			d := c.currentDialer
+			c.mu.Unlock()
+
+			type dialResult struct {
+				conn net.Conn
+				err  error
+			}
+
+			ch := make(chan dialResult, 1)
+			go func() {
+				conn, err := d.DialContext(ctx, network, addr)
+				ch <- dialResult{conn, err}
+			}()
+
+			select {
+			case r := <-ch:
+				if r.err == nil {
+					return r.conn, nil
+				}
+			case <-time.After(10 * time.Second):
+			}
+
+			log.Warn().Msgf("SSH dial failed or timed out, creating new dialer")
+			newDialer, err2 := sshproxy.NewDialer(sshAddr)
+			if err2 != nil {
+				return nil, fmt.Errorf("SSH reconnect failed: %w", err2)
+			}
+
+			c.mu.Lock()
+			c.currentDialer = newDialer
+			c.mu.Unlock()
+			log.Info().Msgf("SSH dialer refreshed")
+
+			return newDialer.DialContext(ctx, network, addr)
+		},
 	}
 	return svc.ListenAndServe("tcp", socks5Address)
 }

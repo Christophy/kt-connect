@@ -23,9 +23,9 @@ func SetupPortForwardToLocal(podName string, remotePort, localPort int) (chan in
 
 func setupPortForwardToLocal(podName string, remotePort, localPort int, gone chan int, isInitConnect bool) error {
 	ready := make(chan struct{})
+	stop := make(chan struct{})
 	var ticker *time.Ticker
 	go func() {
-		stop := make(chan struct{})
 		fw, err := createPortForwarder(podName, remotePort, localPort, stop, ready)
 		if err != nil {
 			log.Warn().Err(err).Msgf("Invalid port forward parameter")
@@ -45,12 +45,18 @@ func setupPortForwardToLocal(podName string, remotePort, localPort int, gone cha
 		}
 		time.Sleep(time.Duration(opt.Get().Global.PortForwardTimeout) * time.Second)
 		log.Debug().Msgf("Port forward reconnecting ...")
-		_ = setupPortForwardToLocal(podName, remotePort, localPort, gone, false)
+		for {
+			if err = setupPortForwardToLocal(podName, remotePort, localPort, gone, false); err == nil {
+				break
+			}
+			log.Warn().Err(err).Msgf("Port forward reconnect failed, retrying in 10s")
+			time.Sleep(10 * time.Second)
+		}
 	}()
 
 	select {
 	case <-ready:
-		ticker = cluster.SetupPortForwardHeartBeat(localPort)
+		ticker = cluster.SetupPortForwardHeartBeat(localPort, remotePort, stop)
 		log.Info().Msgf("Port forward local:%d -> pod %s:%d established", localPort, podName, remotePort)
 		return nil
 	case <-time.After(time.Duration(opt.Get().Global.PortForwardTimeout) * time.Second):
