@@ -28,6 +28,22 @@ You can download and install the `ktctl` from [Downloads And Install](docs/en-us
 
 Read the [Quick Start Guide](docs/en-us/guide/quickstart.md) for more about this tool.
 
+## 🔨 Building from Source
+
+This project requires **Go 1.18** to compile. Building with newer Go versions (e.g. 1.24) will fail due to incompatible dependencies (`gvisor` and `go-shadowsocks2`).
+
+If you only have a newer Go installed, use the official Go toolchain manager to install 1.18 side-by-side:
+
+```bash
+go install golang.org/dl/go1.18@latest
+go1.18 download
+
+# Build with Go 1.18
+GOPROXY=https://goproxy.cn,https://proxy.golang.org,direct go1.18 build -o ktctl ./cmd/ktctl/
+```
+
+The `go1.18` binary is installed to `~/go/bin/go1.18` and does not affect your system Go.
+
 ## 💡 Ask For Help
 
 Please feel free to raise an [issue](https://github.com/alibaba/kt-connect/issues) if anything sucks, or go ahead to contact us with DingTalk（钉钉）:

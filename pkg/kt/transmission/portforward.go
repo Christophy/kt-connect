@@ -22,40 +22,60 @@ func SetupPortForwardToLocal(podName string, remotePort, localPort int) (chan in
 }
 
 func setupPortForwardToLocal(podName string, remotePort, localPort int, gone chan int, isInitConnect bool) error {
-	ready := make(chan struct{})
+	initReady := make(chan struct{})
 	stop := make(chan struct{})
 	var ticker *time.Ticker
 	go func() {
-		fw, err := createPortForwarder(podName, remotePort, localPort, stop, ready)
-		if err != nil {
-			log.Warn().Err(err).Msgf("Invalid port forward parameter")
-			return
-		}
-		// will hang here
-		err = fw.ForwardPorts()
-		if err != nil {
-			if isInitConnect {
-				log.Error().Err(err).Msgf("Failed to setup port forward local:%d -> pod %s:%d", localPort, podName, remotePort)
-			} else {
+		first := true
+		for {
+			ready := initReady
+			if !first {
+				ready = make(chan struct{})
+			}
+			fw, err := createPortForwarder(podName, remotePort, localPort, stop, ready)
+			if err != nil {
+				log.Warn().Err(err).Msgf("Port forward create failed, retrying in 10s")
+				time.Sleep(10 * time.Second)
+				stop = make(chan struct{})
+				continue
+			}
+			fwDone := make(chan error, 1)
+			go func() {
+				fwDone <- fw.ForwardPorts()
+			}()
+			if !first {
+				select {
+				case <-ready:
+					ticker = cluster.SetupPortForwardHeartBeat(localPort, remotePort, stop)
+					log.Info().Msgf("Port forward local:%d -> pod %s:%d re-established", localPort, podName, remotePort)
+				case err := <-fwDone:
+					log.Debug().Err(err).Msgf("Port forward exited before ready")
+					time.Sleep(10 * time.Second)
+					stop = make(chan struct{})
+					continue
+				case <-time.After(time.Duration(opt.Get().Global.PortForwardTimeout) * time.Second):
+					log.Warn().Msgf("Port forward reconnect timeout, retrying in 10s")
+					time.Sleep(10 * time.Second)
+					stop = make(chan struct{})
+					continue
+				}
+			}
+			first = false
+			err = <-fwDone
+			if err != nil {
 				log.Debug().Err(err).Msgf("Port forward local:%d -> pod %s:%d interrupted", localPort, podName, remotePort)
 			}
-		}
-		if ticker != nil {
-			ticker.Stop()
-		}
-		time.Sleep(time.Duration(opt.Get().Global.PortForwardTimeout) * time.Second)
-		log.Debug().Msgf("Port forward reconnecting ...")
-		for {
-			if err = setupPortForwardToLocal(podName, remotePort, localPort, gone, false); err == nil {
-				break
+			if ticker != nil {
+				ticker.Stop()
 			}
-			log.Warn().Err(err).Msgf("Port forward reconnect failed, retrying in 10s")
 			time.Sleep(10 * time.Second)
+			log.Debug().Msgf("Port forward reconnecting ...")
+			stop = make(chan struct{})
 		}
 	}()
 
 	select {
-	case <-ready:
+	case <-initReady:
 		ticker = cluster.SetupPortForwardHeartBeat(localPort, remotePort, stop)
 		log.Info().Msgf("Port forward local:%d -> pod %s:%d established", localPort, podName, remotePort)
 		return nil
